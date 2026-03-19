@@ -1,1 +1,215 @@
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
 
+
+class MultiStockEnv(gym.Env):
+
+    metadata = {"render_modes": []}
+
+    def __init__(
+        self,
+        prices: np.ndarray,
+        macd:   np.ndarray,
+        rsi:    np.ndarray,
+        cci:    np.ndarray,
+        adx:    np.ndarray,
+        initial_cash: float = 1_000_000,
+        hmax: int = 100,
+        transaction_cost: float = 0.001,
+        turbulence_threshold: float = 140,
+        turbulence: np.ndarray | None = None,
+    ):
+        super().__init__()
+
+        self.prices = prices.astype(np.float32)
+        self.macd   = macd.astype(np.float32)
+        self.rsi    = rsi.astype(np.float32)
+        self.cci    = cci.astype(np.float32)
+        self.adx    = adx.astype(np.float32)
+
+        self.T         = prices.shape[0]
+        self.stock_dim = prices.shape[1]
+        assert self.stock_dim == 30, "Expected 30 stocks (DJIA constituents)."
+
+        self.initial_cash         = float(initial_cash)
+        self.hmax                 = int(hmax)
+        self.transaction_cost     = float(transaction_cost)
+        self.turbulence_threshold = float(turbulence_threshold)
+
+        self.turbulence = (
+            turbulence.astype(np.float32)
+            if turbulence is not None
+            else self._compute_turbulence()
+        )
+
+        self.action_space = spaces.Box(
+            low=-1.0, high=1.0,
+            shape=(self.stock_dim,),
+            dtype=np.float32,
+        )
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf,
+            shape=(181,),
+            dtype=np.float32,
+        )
+
+        self.reset()
+
+    def _compute_turbulence(self) -> np.ndarray:
+        returns    = np.diff(self.prices, axis=0) / (self.prices[:-1] + 1e-8)
+        turbulence = np.zeros(self.T, dtype=np.float32)
+
+        for t in range(1, self.T):
+            hist = returns[:t]
+            if hist.shape[0] < 2:
+                continue
+            mu    = hist.mean(axis=0)
+            Sigma = np.cov(hist, rowvar=False)
+            try:
+                Sigma_inv = np.linalg.pinv(Sigma)
+            except np.linalg.LinAlgError:
+                continue
+            y = returns[t - 1] - mu
+            turbulence[t] = float(y @ Sigma_inv @ y)
+
+        return turbulence
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.day                = 0
+        self.cash               = self.initial_cash
+        self.holdings           = np.zeros(self.stock_dim, dtype=np.int32)
+        self._turbulence_active = False
+        return self._get_state(), {}
+
+    def _get_state(self) -> np.ndarray:
+        return np.concatenate([
+            np.array([self.cash], dtype=np.float32),
+            self.prices[self.day],
+            self.holdings.astype(np.float32),
+            self.macd[self.day],
+            self.rsi[self.day],
+            self.cci[self.day],
+            self.adx[self.day],
+        ])
+
+    def _portfolio_value(self) -> float:
+        return float(self.cash + np.dot(self.holdings, self.prices[self.day]))
+
+    def step(self, actions: np.ndarray):
+        assert self.day < self.T - 1, "Episode already finished; call reset()."
+
+        actions        = np.clip(actions, -1.0, 1.0)
+        current_prices = self.prices[self.day]
+        begin_value    = self._portfolio_value()
+        turb           = float(self.turbulence[self.day])
+
+        if turb > self.turbulence_threshold:
+            self._turbulence_active = True
+            self._sell_all(current_prices)
+        else:
+            self._turbulence_active = False
+            share_actions = (actions * self.hmax).astype(np.int32)
+            for i in np.where(share_actions < 0)[0]:
+                self._sell(i, abs(share_actions[i]), current_prices[i])
+            for i in np.where(share_actions > 0)[0]:
+                self._buy(i, share_actions[i], current_prices[i])
+
+        self.day += 1
+        done      = self.day >= self.T - 1
+        end_value = self._portfolio_value()
+        reward    = end_value - begin_value
+
+        info = {
+            "portfolio_value":   end_value,
+            "cash":              self.cash,
+            "holdings":          self.holdings.copy(),
+            "turbulence":        turb,
+            "turbulence_active": self._turbulence_active,
+            "day":               self.day,
+        }
+        return self._get_state(), reward, done, False, info
+
+    def _sell(self, i: int, n_shares: int, price: float) -> None:
+        shares_to_sell = min(n_shares, int(self.holdings[i]))
+        if shares_to_sell <= 0:
+            return
+        gross = shares_to_sell * price
+        self.cash        += gross - gross * self.transaction_cost
+        self.holdings[i] -= shares_to_sell
+
+    def _buy(self, i: int, n_shares: int, price: float) -> None:
+        if n_shares <= 0:
+            return
+        affordable    = int(self.cash // (price * (1.0 + self.transaction_cost)))
+        shares_to_buy = min(n_shares, affordable)
+        if shares_to_buy <= 0:
+            return
+        total_cost       = shares_to_buy * price
+        self.cash       -= total_cost + total_cost * self.transaction_cost
+        self.holdings[i] += shares_to_buy
+
+    def _sell_all(self, prices: np.ndarray) -> None:
+        for i in range(self.stock_dim):
+            if self.holdings[i] > 0:
+                self._sell(i, int(self.holdings[i]), float(prices[i]))
+
+    def render(self, mode: str = "human") -> None:
+        pv = self._portfolio_value()
+        print(
+            f"Day {self.day:>4d} | Portfolio ${pv:>14,.2f} | "
+            f"Cash ${self.cash:>14,.2f} | "
+            f"Turbulence {self.turbulence[self.day]:.1f}"
+            f"{'  ⚠ CRASH MODE' if self._turbulence_active else ''}"
+        )
+
+    @staticmethod
+    def sharpe_ratio(
+        portfolio_values: np.ndarray,
+        risk_free_rate: float = 0.0,
+        periods_per_year: int = 252,
+    ) -> float:
+        returns = np.diff(portfolio_values) / portfolio_values[:-1]
+        if returns.std() < 1e-10:
+            return 0.0
+        excess   = returns - risk_free_rate / periods_per_year
+        ann_mean = excess.mean() * periods_per_year
+        ann_std  = returns.std() * np.sqrt(periods_per_year)
+        return float(ann_mean / ann_std)
+
+
+if __name__ == "__main__":
+    np.random.seed(42)
+    T, D = 300, 30
+
+    prices = np.abs(np.random.randn(T, D) * 10 + 100).astype(np.float32)
+    macd   = np.random.randn(T, D).astype(np.float32)
+    rsi    = (np.random.rand(T, D) * 100).astype(np.float32)
+    cci    = np.random.randn(T, D).astype(np.float32) * 100
+    adx    = (np.random.rand(T, D) * 50).astype(np.float32)
+
+    env = MultiStockEnv(prices, macd, rsi, cci, adx)
+
+    obs, _ = env.reset()
+    assert obs.shape == (181,), f"Expected (181,), got {obs.shape}"
+    print(f"✓ State shape : {obs.shape}")
+
+    total_reward     = 0.0
+    portfolio_values = [env._portfolio_value()]
+
+    for step in range(T - 2):
+        obs, reward, done, _, info = env.step(env.action_space.sample())
+        total_reward += reward
+        portfolio_values.append(info["portfolio_value"])
+        if done:
+            break
+
+    sharpe = MultiStockEnv.sharpe_ratio(np.array(portfolio_values))
+    print(f"✓ Steps completed   : {step + 1}")
+    print(f"✓ Final portfolio   : ${info['portfolio_value']:,.2f}")
+    print(f"✓ Total reward      : ${total_reward:,.2f}")
+    print(f"✓ Sharpe ratio      : {sharpe:.4f}")
+    print(f"✓ Cash remaining    : ${info['cash']:,.2f}")
+    print(f"✓ Turbulence active : {info['turbulence_active']}")
+    print("\nAll assertions passed.")
