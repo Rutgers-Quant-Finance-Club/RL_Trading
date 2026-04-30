@@ -16,7 +16,7 @@ class StockMarketEnv(gym.Env):
         self.transaction_cost_pct = transaction_cost_pct
         self.turbulence_threshold = turbulence_threshold
         self.action_space = spaces.Box(low=-1, high=1, shape=(self.stock_dim,), dtype=np.float32)
-        self.state_dim = 1 + (6 * self.stock_dim)
+        self.state_dim = 1 + (6 * self.stock_dim) #181 dim
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.state_dim,), dtype=np.float32)
         self.balance = self.initial_balance
         self.shares = np.zeros(self.stock_dim)
@@ -34,7 +34,7 @@ class StockMarketEnv(gym.Env):
 
     
     def _get_observation(self):
-        """Constructs the 181-dimensional state vector for the current time step."""
+        #Constructs the 181-dimensional state vector for the current time step
         current_data = self.df[self.df['date'] == self.dates[self.current_step]]
         
         prices = current_data['close'].values
@@ -65,12 +65,13 @@ class StockMarketEnv(gym.Env):
         prices = current_data['close'].values
         turbulence = current_data['turbulence'].values[0] if 'turbulence' in current_data.columns else 0
         
-        # ---------------------------------------------------------
-        # RISK AVERSION / MARKET CRASH LOGIC (Section III.B)
-        # ---------------------------------------------------------
+
+        # market crash logic
         if self.turbulence_threshold is not None and turbulence > self.turbulence_threshold:
-            # Halt buying and sell all shares
             actions = np.where(self.shares > 0, -1, 0) 
+
+
+
 
         # Un-normalize actions from [-1, 1] to [-h_max, h_max]
         actions = actions * self.h_max 
@@ -84,10 +85,11 @@ class StockMarketEnv(gym.Env):
         sell_indices = argsort_actions[:np.where(actions < 0)[0].shape[0]]
         buy_indices = argsort_actions[::-1][:np.where(actions > 0)[0].shape[0]]
 
-        # Execute Sells
+
+
+        #sell
         for index in sell_indices:
             action = actions[index]
-            # Ensure we don't sell more than we own
             sell_amount = min(abs(action), self.shares[index])
             if sell_amount > 0:
                 self.shares[index] -= sell_amount
@@ -95,10 +97,9 @@ class StockMarketEnv(gym.Env):
                 transaction_cost = sale_revenue * self.transaction_cost_pct
                 self.balance += (sale_revenue - transaction_cost)
                 
-        # Execute Buys
+        #buy
         for index in buy_indices:
             action = actions[index]
-            # Constraints: Non-negative balance check
             cost_per_share = prices[index] * (1 + self.transaction_cost_pct)
             buy_amount = min(action, self.balance // cost_per_share)
             
@@ -108,25 +109,17 @@ class StockMarketEnv(gym.Env):
                 transaction_cost = purchase_cost * self.transaction_cost_pct
                 self.balance -= (purchase_cost + transaction_cost)
 
-        # Move to next time step (t+1)
+        #next time step
         self.current_step += 1
         
-        # ---------------------------------------------------------
-        # REWARD FUNCTION (Section III.C)
-        # ---------------------------------------------------------
+
+        #reward
         next_data = self.df[self.df['date'] == self.dates[self.current_step]]
         next_prices = next_data['close'].values
-        
-        # Calculate new portfolio value (t+1)
         portfolio_value_t_plus_1 = self.balance + np.sum(next_prices * self.shares)
-        
-        # Reward is the change in portfolio value
         reward = portfolio_value_t_plus_1 - portfolio_value_t
         self.portfolio_value = portfolio_value_t_plus_1
-        
-        # Update State
         self.state = self._get_observation()
-        
         return self.state, reward, self.terminal, {}
 
     def render(self, mode='human'):
@@ -135,6 +128,7 @@ class StockMarketEnv(gym.Env):
         print(f"Balance: {self.balance:.2f}")
         print(f"Portfolio Value: {self.portfolio_value:.2f}")
         print("-" * 30)
+
 
 
 
